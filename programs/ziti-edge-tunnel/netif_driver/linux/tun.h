@@ -21,9 +21,18 @@
 #include <net/if.h>
 #include "ziti/netif_driver.h"
 
+typedef struct zt__netlink_socket zt__netlink_socket_t;
+typedef struct dnsmasq_process_s zt__dnsmasq_process_t;
+
 struct netif_handle_s {
     int  fd;
     char name[IFNAMSIZ];
+
+    int ifindex;
+
+    zt__netlink_socket_t *route_sock;
+
+    zt__dnsmasq_process_t *dnsmasq_proc;
 
     model_map *route_updates;
 };

@@ -14,6 +14,7 @@
  limitations under the License.
  */
 
+#define _GNU_SOURCE
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -34,9 +35,19 @@
 #include "tun.h"
 #include "utils.h"
 
+#include <linux/capability.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <grp.h>
+#include <pwd.h>
+#include <sched.h>
+
 #ifndef DEVTUN
 #define DEVTUN "/dev/net/tun"
 #endif
+
+#define ZITI_USER     "ziti"
+#define MAX_NLMSG_LEN 1024
 
 /*
  * ip link set tun0 up
@@ -49,7 +60,15 @@
 #define IP_BIN "/sbin/ip "
 #endif
 
-#define CHECK_UV(op) do{ int rc = op; if (rc < 0) ZITI_LOG(ERROR, "uv_err: %d/%s", rc, uv_strerror(rc)); } while(0)
+#define CHECK_UV(op) \
+    __extension__({ int rc = (op); if (rc < 0) ZITI_LOG(ERROR, "uv_err: %d/%s", rc, uv_strerror(rc)); rc >= 0; })
+
+enum route_command { ROUTE_NOOP = 0, ROUTE_ADD = 1, ROUTE_DEL };
+
+struct zt__netlink_socket {
+    uv_udp_t h;
+    uint32_t seq;
+};
 
 extern void dns_set_miss_status(int code);
 
@@ -59,6 +78,25 @@ static void dns_update_systemd_resolve(const char* tun, unsigned int ifindex, co
 static void (*dns_updater)(const char* tun, unsigned int ifindex, const char* addr);
 static uv_once_t dns_updater_init;
 
+static zt__netlink_socket_t *netlink_socket(uv_loop_t *loop, int protocol, unsigned int subscriptions);
+static int netlink_sendmsg(zt__netlink_socket_t *sock, struct nlmsghdr *nlm);
+static void netlink_close_cb(uv_handle_t *handle);
+static int netlink_addattrl(struct nlmsghdr *nlm, int maxlen, int type, const void *data, int dlen);
+static int netlink_addattr32(struct nlmsghdr *nlm, int maxlen, int type, uint32_t data);
+
+static int get_netns_fd(const char *name);
+static int join_netns(const char *netns);
+static int restore_netns(int old_netns);
+
+struct dnsmasq_process_s {
+  uv_process_t base;
+};
+
+typedef struct dnsmasq_process_s dnsmasq_process_t;
+
+static dnsmasq_process_t *dnsmasq_spawn(uv_loop_t *, const char *netns);
+static void dnsmasq_terminate(dnsmasq_process_t *proc);
+
 static struct {
     char tun_name[IFNAMSIZ];
     uint32_t dns_ip;
@@ -67,6 +105,194 @@ static struct {
     uv_timer_t update_timer;
 } dns_maintainer;
 
+#define NLMSG_TAIL(nmsg) \
+   ((struct rtattr *) (((char *) (nmsg)) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
+
+int get_netns_fd(const char *name)
+{
+    const char *p;
+
+    p = strchr(name, '/');
+    if (p) {
+        return open(name, O_RDONLY|O_CLOEXEC, 0);
+    }
+
+    for (const char *stem, **stems = (const char*[]) { "/run/netns", "/var/run/netns", NULL };
+        (stem = *stems);
+        stems++) {
+        char *pathbuf = NULL;
+        int fd;
+
+        if (asprintf(&pathbuf, "%s/%s", stem, name) < 0)
+            return -1;
+
+        fd = open(pathbuf, O_RDONLY|O_CLOEXEC, 0);
+        free(pathbuf);
+        if (fd < 0 && errno == ENOENT)
+            continue;
+
+        return fd;
+    }
+
+    errno = ENOENT;
+    return -1;
+}
+
+static int join_netns(const char *name)
+{
+    int old_netns = -1, netns;
+    int ret, saved_errno;
+
+    old_netns = open("/proc/self/ns/net", O_RDONLY|O_CLOEXEC, 0);
+    if (old_netns < 0)
+        abort();
+
+    netns = get_netns_fd(name);
+    /**
+     * If the netns doesn't exist, try creating it.
+     */
+    if (netns < 0 && errno == ENOENT) {
+        if (run_command("ip netns add %s", name) == 0)
+            run_command("ip link set lo up");
+        netns = get_netns_fd(name);
+    }
+
+    if (netns < 0)
+      abort();
+
+    ret = setns(netns, CLONE_NEWNET);
+    saved_errno = errno;
+    (void) close(netns);
+    errno = saved_errno;
+
+    if (!ret) {
+        abort();
+    }
+
+    return old_netns;
+}
+
+static
+int
+restore_netns(int old_netns)
+{
+  int rv;
+
+  rv = setns(old_netns, CLONE_NEWNET);
+  if (rv < 0)
+    abort();
+  close(old_netns);
+  return 0;
+}
+
+static zt__netlink_socket_t *netlink_socket(uv_loop_t *loop, int protocol, unsigned int subscriptions)
+{
+    int sd = socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, protocol);
+    if (sd < 0) {
+        ZITI_LOG(ERROR, "RTNETLINK: cannot open netlink socket: %d/%s",
+            errno, strerror(errno));
+        return NULL;
+    }
+
+    int sndbuf = 32*1024;
+    if (setsockopt(sd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf) < 0) {
+        ZITI_LOG(ERROR, "RTNETLINK: SNDBUF: %d/%s",
+            errno, strerror(errno));
+        goto err;
+    }
+
+    int rcvbuf = 1024*1024;
+    if (setsockopt(sd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf) < 0) {
+        ZITI_LOG(ERROR, "RTNETLINK: SNDBUF: %d/%s",
+            errno, strerror(errno));
+        goto err;
+    }
+
+    struct sockaddr_nl name = { .nl_family = AF_NETLINK, .nl_groups = subscriptions };
+    if (bind(sd, (struct sockaddr *)&name, sizeof name) < 0) {
+        ZITI_LOG(ERROR, "RTNETLINK: cannot bind name to socket: %d/%s",
+            errno, strerror(errno));
+        goto err;
+    }
+
+    zt__netlink_socket_t *sock = calloc(sizeof *sock, 1);
+    if (!sock) {
+        ZITI_LOG(ERROR, "RTNETLINK: out of memory");
+        goto err;
+    }
+
+    int rc = uv_udp_init(loop, &sock->h);
+    if (!CHECK_UV(rc)) {
+        goto err;
+    }
+
+    rc = uv_udp_open(&sock->h, sd);
+    if (!CHECK_UV(rc)) {
+        uv_close((uv_handle_t *)&sock->h, netlink_close_cb);
+        return NULL;
+    }
+
+    struct timeval tv;
+    (void) gettimeofday(&tv, NULL);
+    sock->seq = tv.tv_usec;
+
+    return sock;
+
+err:
+    (void) close(sd);
+    return NULL;
+}
+
+static int netlink_sendmsg(zt__netlink_socket_t *sock, struct nlmsghdr *nlm)
+{
+    /**
+     * Update sequence number. Ignore zero as special
+     */
+    nlm->nlmsg_seq = sock->seq++;
+    if (!nlm->nlmsg_seq) nlm->nlmsg_seq = sock->seq++;
+
+    uv_udp_send_t send_req;
+    uv_buf_t send_buf = uv_buf_init((char *)nlm, nlm->nlmsg_len);
+    int status = uv_udp_send(&send_req, &sock->h, &send_buf, 1, NULL, NULL);
+    if (status < 0) {
+        ZITI_LOG(WARN, "RTNETLINK: failed sending message: %d/%s", status, uv_strerror(status));
+        return -1;
+    }
+
+    return 0;
+}
+
+static void netlink_close_cb(uv_handle_t *handle)
+{
+    zt__netlink_socket_t *sock = (zt__netlink_socket_t *)((char *)handle - offsetof(struct zt__netlink_socket, h));
+    free(sock);
+}
+
+static int netlink_addattrl(struct nlmsghdr *nlm, int maxlen, int type, const void *data, int dlen)
+{
+    int alen = RTA_LENGTH(dlen);
+    int newlen = NLMSG_ALIGN(nlm->nlmsg_len) + RTA_ALIGN(alen);
+
+    if (newlen > maxlen) {
+        ZITI_LOG(WARN, "RTNETLINK: message exceeds length limit of %d", maxlen);
+        return -1;
+    }
+
+    struct rtattr *rta = NLMSG_TAIL(nlm);
+    rta->rta_type = type;
+    rta->rta_len = alen;
+    memcpy(RTA_DATA(rta), data, dlen);
+
+    nlm->nlmsg_len = newlen;
+
+    return 0;
+}
+
+static int netlink_addattr32(struct nlmsghdr *nlm, int maxlen, int type, uint32_t data)
+{
+  return netlink_addattrl(nlm, maxlen, type, &data, sizeof data);
+}
+
 static int tun_close(struct netif_handle_s *tun) {
     int r = 0;
 
@@ -74,7 +300,14 @@ static int tun_close(struct netif_handle_s *tun) {
         return 0;
     }
 
-    if (tun->fd > 0) {
+    dnsmasq_terminate(tun->dnsmasq_proc);
+
+    if (tun->route_sock) {
+        uv_udp_recv_stop(&tun->route_sock->h);
+        uv_close((uv_handle_t *)&tun->route_sock->h, netlink_close_cb);
+    }
+
+    if (tun->fd > -1) {
         r = close(tun->fd);
     }
 
@@ -98,14 +331,16 @@ int tun_add_route(netif_handle tun, const char *dest) {
     if (tun->route_updates == NULL) {
         tun->route_updates = calloc(1, sizeof(*tun->route_updates));
     }
-    model_map_set(tun->route_updates, dest, (void*)(uintptr_t)true);
+    model_map_set(tun->route_updates, dest, (void*)(uintptr_t)ROUTE_ADD);
+    return 0;
 }
 
 int tun_delete_route(netif_handle tun, const char *dest) {
     if (tun->route_updates == NULL) {
         tun->route_updates = calloc(1, sizeof(*tun->route_updates));
     }
-    model_map_set(tun->route_updates, dest, (void*)(uintptr_t)false);
+    model_map_set(tun->route_updates, dest, (void*)(uintptr_t)ROUTE_DEL);
+    return 0;
 }
 
 struct rt_process_cmd {
@@ -126,67 +361,81 @@ static void route_updates_done(uv_work_t *wr, int status) {
     free(wr);
 }
 
+static int route_cmd(netif_handle tun, enum route_command cmd, const ziti_address *dest)
+{
+    union request {
+        struct {
+            struct nlmsghdr nlm;
+            struct rtmsg rtm;
+        };
+        char data[MAX_NLMSG_LEN];
+    } request = {
+        .nlm.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg)),
+        .nlm.nlmsg_flags = NLM_F_REQUEST,
+        .rtm.rtm_table = RT_TABLE_MAIN,
+        .rtm.rtm_scope = RT_SCOPE_LINK,
+        .rtm.rtm_protocol = RTPROT_STATIC,
+        .rtm.rtm_type = RTN_UNICAST,
+    };
+
+    switch (cmd) {
+      case ROUTE_ADD:
+          request.nlm.nlmsg_type = RTM_NEWROUTE;
+          request.nlm.nlmsg_flags |= NLM_F_CREATE|NLM_F_EXCL;
+          break;
+      case ROUTE_DEL:
+          request.nlm.nlmsg_type = RTM_DELROUTE;
+          break;
+      default:
+          return -1;
+    }
+
+    if (dest->type != ziti_address_cidr)
+        return -1;
+
+    size_t iplen;
+    switch (dest->addr.cidr.af) {
+      case AF_INET:
+          iplen = sizeof(struct in_addr);
+          break;
+      case AF_INET6:
+          iplen = sizeof(struct in6_addr);
+          break;
+      default:
+          return -1;
+    }
+
+    request.rtm.rtm_family = dest->addr.cidr.af;
+    request.rtm.rtm_dst_len = dest->addr.cidr.bits;
+    if (netlink_addattrl(&request.nlm, sizeof request, RTA_DST, &dest->addr.cidr.ip, iplen) < 0)
+        return -1;
+    if (netlink_addattr32(&request.nlm, sizeof request, RTA_OIF, tun->ifindex) < 0)
+        return -1;
+
+    return netlink_sendmsg(tun->route_sock, &request.nlm);
+}
+
 static void process_routes_updates(uv_work_t *wr) {
     struct rt_process_cmd *cmd = wr->data;
 
-    uv_fs_t tmp_req = {0};
-    uv_file routes_file = uv_fs_mkstemp(wr->loop, &tmp_req, "/tmp/ziti-tunnel-routes.XXXXXX", NULL);
-    if (routes_file < 0) {
-        ZITI_LOG(ERROR, "failed to create temp file for route updates %d/%s", routes_file, uv_strerror(routes_file));
-        uv_fs_req_cleanup(&tmp_req);
-        return;
-    }
-
-    // get route deletes first
-    static const char *const verbs[] = {
-        "delete",
-        "add",
-    };
-    char buf[1024];
-    for (size_t i = 0; i < sizeof verbs/sizeof verbs[0]; i++) {
-        const char *const verb = verbs[i];
+    // delete before add
+    for (enum route_command action, *actions = (enum route_command[]) { ROUTE_DEL, ROUTE_ADD, ROUTE_NOOP }; (action = *actions) != ROUTE_NOOP; actions++) {
         const char *prefix;
         const void *value;
 
         MODEL_MAP_FOREACH(prefix, value, cmd->updates) {
-            // action == 0: delete
-            // action == 1: add
-            unsigned action = (uintptr_t) value;
-            if (action == i) {
-                int len = snprintf(buf, sizeof(buf), "route %s %s dev %s\n", verb, prefix, cmd->tun->name);
-                if (len < 0 || (size_t) len >= sizeof buf) {
-                    if (len > 0) errno = ENOMEM;
-                    ZITI_LOG(ERROR, "route updates failed %d/%s", -errno, strerror(errno));
-                    goto close_file;
+            if (action == (uintptr_t) value) {
+                ziti_address address;
+
+                if (parse_ziti_address_str(&address, prefix) < 0 || address.type != ziti_address_cidr) {
+                    ZITI_LOG(ERROR, "failed to parse address '%s'", prefix);
+                    continue;
                 }
 
-                uv_fs_t write_req;
-                uv_buf_t b = uv_buf_init(buf, len);
-                int rc = uv_fs_write(wr->loop, &write_req, routes_file, &b, 1, -1, NULL);
-                uv_fs_req_cleanup(&write_req);
-                /* if an incomplete write is encountered, bail.
-                 * Don't want to execute clipped commands
-                 */
-                if (rc < len) {
-                    if (rc > 0) rc = UV_EIO;
-                    ZITI_LOG(ERROR, "route updates failed %d/%s", rc, uv_strerror(rc));
-                    goto close_file;
-                }
+                route_cmd(cmd->tun, action, &address);
             }
         }
     }
-
-    run_command("ip -force -batch %s", uv_fs_get_path(&tmp_req));
-
-close_file: ; /* declaration is not a statement */
-    uv_fs_t unlink_req;
-    (void) uv_fs_unlink(wr->loop, &unlink_req, uv_fs_get_path(&tmp_req), NULL);
-    uv_fs_req_cleanup(&unlink_req);
-    uv_fs_req_cleanup(&tmp_req);
-
-    uv_fs_t close_req;
-    (void) uv_fs_close(wr->loop, &close_req, routes_file, NULL);
-    uv_fs_req_cleanup(&close_req);
 }
 
 int tun_commit_routes(netif_handle tun, uv_loop_t *l) {
@@ -308,8 +557,9 @@ static void do_dns_update(uv_loop_t *loop, int delay) {
 }
 
 void nl_alloc(uv_handle_t *h, size_t req, uv_buf_t *b) {
+    req = req < MAX_NLMSG_LEN ? MAX_NLMSG_LEN : req;
     b->base = malloc(req);
-    b->len = req;
+    b->len = b->base ? req : 0;
 }
 
 void on_nl_message(uv_udp_t *nl, ssize_t len, const uv_buf_t *buf, const struct sockaddr * addr, unsigned int i) {
@@ -397,7 +647,108 @@ static int tun_exclude_rt(netif_handle dev, uv_loop_t *l, const char *addr) {
     return run_command("ip route replace %s %s", addr, route);
 }
 
-netif_driver tun_open(uv_loop_t *loop, uint32_t tun_ip, uint32_t dns_ip, const char *dns_block, char *error, size_t error_len) {
+static int tun_noop_exclude_rt(netif_handle dev, uv_loop_t *l, const char *addr)
+{
+    /* UNUSED */
+    (void) dev;
+    (void) l;
+    (void) addr;
+    return 0;
+}
+
+static void netlink_on_response(uv_udp_t *route_sock, ssize_t nread, const uv_buf_t *resp, const struct sockaddr *addr, unsigned flags)
+{
+    /* UNUSED */
+    (void) route_sock;
+    (void) addr;
+    (void) flags;
+
+    if (nread < 0) {
+        ZITI_LOG(WARN, "RTNETLINK: %zd/%s", nread, uv_strerror(nread));
+        goto done;
+    }
+
+    for (struct nlmsghdr *h = (struct nlmsghdr *)resp->base; NLMSG_OK(h, nread); h = NLMSG_NEXT(h, nread)) {
+        if (h->nlmsg_type == NLMSG_ERROR) {
+            struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(h);
+
+            if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) {
+                ZITI_LOG(WARN, "RTNETLINK: error truncated");
+                goto done;
+            }
+
+            if (err->error)
+                ZITI_LOG(WARN, "RTNETLINK: %d/%s", -err->error, strerror(-err->error));
+        }
+    }
+
+done:
+    free(resp->base);
+}
+
+static int become_unprivileged(void)
+{
+    int saved_errno;
+    if (geteuid() == 0) {
+        struct passwd *pw;
+        if ((pw = getpwnam(ZITI_USER)) == NULL) {
+            saved_errno = errno;
+            ZITI_LOG(ERROR, "getpwname: %d/%s", saved_errno, strerror(saved_errno));
+            errno = saved_errno;
+            return -1;
+        }
+
+        if (setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) < 0) {
+            saved_errno = errno;
+            ZITI_LOG(ERROR, "getgid: %d/%s", errno, strerror(errno));
+            errno = saved_errno;
+            return -1;
+        }
+
+        if (initgroups(ZITI_USER, pw->pw_gid) < 0) {
+            saved_errno = errno;
+            ZITI_LOG(ERROR, "setgroups: %d/%s", errno, strerror(errno));
+            errno = saved_errno;
+            return -1;
+        }
+
+        if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0) {
+            saved_errno = errno;
+            ZITI_LOG(ERROR, "keepcaps: %d/%s", errno, strerror(errno));
+            errno = saved_errno;
+            return -1;
+        }
+
+        if (setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) < 0) {
+            saved_errno = errno;
+            ZITI_LOG(ERROR, "setuid: %d/%s", errno, strerror(errno));
+            errno = saved_errno;
+            return -1;
+        }
+
+        struct __user_cap_header_struct hdr = { .version = _LINUX_CAPABILITY_VERSION_3 };
+        struct __user_cap_data_struct datap[_LINUX_CAPABILITY_U32S_3] = {{0}};
+        unsigned int w = CAP_NET_ADMIN / 32, b = CAP_NET_ADMIN % 32;
+        if (w >= sizeof datap/sizeof datap[0]) {
+            saved_errno = errno = EINVAL;
+            ZITI_LOG(ERROR, "capset: %d/%s", errno, strerror(errno));
+            errno = saved_errno;
+            return -1;
+        }
+
+        datap[w].permitted = datap[w].effective = 1UL << b;
+        if (syscall(SYS_capset, &hdr, datap) < 0) {
+            ZITI_LOG(ERROR, "capset: %d/%s", errno, strerror(errno));
+            errno = saved_errno;
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+netif_driver tun_open1(uv_loop_t *loop, uint32_t tun_ip, uint32_t dns_ip, const char *dns_block, char *error, size_t error_len, const char *netns) {
+
     if (error != NULL) {
         memset(error, 0, error_len * sizeof(char));
     }
@@ -431,6 +782,35 @@ netif_driver tun_open(uv_loop_t *loop, uint32_t tun_ip, uint32_t dns_ip, const c
 
     strncpy(tun->name, ifr.ifr_name, sizeof(tun->name));
 
+    if ((tun->ifindex = if_nametoindex(tun->name)) == 0) {
+        if (error != NULL) {
+            snprintf(error, error_len, "failed to get tun's ifindex: %s", strerror(errno));
+        }
+        tun_close(tun);
+        return NULL;
+    }
+
+    zt__netlink_socket_t *route_sock;
+    if ((route_sock = netlink_socket(loop, NETLINK_ROUTE, 0)) == NULL) {
+        if (error != NULL) {
+            snprintf(error, error_len, "failed to get tun's index: %s", strerror(errno));
+        }
+        tun_close(tun);
+        return NULL;
+    }
+
+    int rc = uv_udp_recv_start(&route_sock->h, nl_alloc, netlink_on_response);
+    if (rc < 0) {
+        if (error != NULL) {
+            snprintf(error, error_len, "uv_udp_recv_start: %s", uv_strerror(rc));
+        }
+        uv_close((uv_handle_t *)&route_sock->h, netlink_close_cb);
+        tun_close(tun);
+        return NULL;
+    }
+
+    tun->route_sock = route_sock;
+
     struct netif_driver_s *driver = calloc(1, sizeof(struct netif_driver_s));
     if (driver == NULL) {
         if (error != NULL) {
@@ -447,11 +827,13 @@ netif_driver tun_open(uv_loop_t *loop, uint32_t tun_ip, uint32_t dns_ip, const c
     driver->add_route    = tun_add_route;
     driver->delete_route = tun_delete_route;
     driver->close        = tun_close;
-    driver->exclude_rt   = tun_exclude_rt;
+    driver->exclude_rt   = netns ? tun_noop_exclude_rt : tun_exclude_rt;
     driver->commit_routes = tun_commit_routes;
 
     run_command("ip link set %s up", tun->name);
     run_command("ip addr add %s dev %s", inet_ntoa(*(struct in_addr*)&tun_ip), tun->name);
+
+    run_command("ip link set lo up");
 
     if (dns_ip) {
         init_dns_maintainer(loop, tun->name, dns_ip);
@@ -462,4 +844,173 @@ netif_driver tun_open(uv_loop_t *loop, uint32_t tun_ip, uint32_t dns_ip, const c
     }
 
     return driver;
+}
+
+static
+void *
+Xcalloc(size_t count, size_t size)
+{
+  void *p;
+
+  if (!count || !size)
+    abort();
+
+  p = calloc(count, size);
+  if (!p)
+    abort();
+
+  return p;
+}
+
+static
+void *
+Xmalloc(size_t n)
+{
+  return Xcalloc(1, n);
+}
+
+static
+char *
+Xstrdup(const char *s)
+{
+  size_t n = strlen(s)+1;
+  return memcpy(Xmalloc(n), s, n);
+}
+
+static
+int
+Xasprintf(char **strp, const char *fmt, ...)
+{
+  va_list args;
+  int ret, saved_errno;
+
+  va_start(args, fmt);
+  ret = vasprintf(strp, fmt, args);
+  saved_errno = errno;
+  va_end(args);
+  errno = saved_errno;
+  if (ret  < 0)
+    abort();
+  return ret;
+}
+
+static
+void
+dnsmasq_exit_cb(uv_process_t *handle, long int exit_status, int term_status)
+{
+    dnsmasq_process_t *proc = (dnsmasq_process_t *)((char *)handle - offsetof(dnsmasq_process_t, base));
+
+    if (exit_status) {
+      ZITI_LOG(ERROR, "dnsmasq exited with code %ld\n", exit_status);
+    } else {
+      ZITI_LOG(ERROR, "dnsmasq exited on signal %d\n", term_status);
+    }
+    proc->base.pid = (pid_t)-1;
+}
+
+static
+dnsmasq_process_t *
+dnsmasq_spawn(uv_loop_t *loop, const char *netns_name)
+{
+    uv_process_options_t opts = {0};
+    dnsmasq_process_t *proc = NULL;
+    const char *argz[8] = {0};
+    const char *envz[3] = {0};
+    char *etc_path = NULL;
+    char *dnsmasq_confdir_path = NULL;
+    char *server_conf = NULL;
+    char *dnsmasq_confdir_conf = NULL;
+    char *pathbuf = NULL;
+    const char *path = NULL;
+    size_t len;
+    int rc;
+
+    // namespace aware
+    if (netns_name) {
+      Xasprintf(&etc_path, "/etc/netns/%s", netns_name);
+    } else {
+      Xasprintf(&etc_path, "/etc");
+    }
+    Xasprintf(&dnsmasq_confdir_path, "%s/dnsmasq.d", etc_path);
+
+    Xasprintf(&server_conf, "--server=%s", "100.64.0.2");
+    if (access(dnsmasq_confdir_path, R_OK|X_OK)) {
+        Xasprintf(&dnsmasq_confdir_conf, "--conf-dir=%s,*.conf", dnsmasq_confdir_path);
+    }
+
+    if ((len = confstr(_CS_PATH, NULL, 0)) > 0
+        && confstr(_CS_PATH, pathbuf = Xmalloc(len), len) > 0) {
+      path = pathbuf;
+    } else {
+      path = "/usr/sbin:/sbin:/usr/bin:/bin";
+    }
+
+    argz[0] = "/usr/sbin/dnsmasq";
+    argz[1] = "--keep-in-foreground";
+    argz[2] = "--conf-file=/dev/null";
+    argz[3] = "--no-resolv";
+    argz[4] = "--no-hosts";
+    argz[5] = server_conf;
+    argz[6] = dnsmasq_confdir_conf;
+    argz[7] = NULL;
+
+    envz[0] = path;
+    envz[1] = "LANG=C";
+    envz[2] = NULL;
+
+    opts.file = (char *) argz[0];
+    opts.args = (char **) argz;
+    opts.env = (char **) envz;
+    opts.cwd = "/";
+    opts.exit_cb = dnsmasq_exit_cb;
+
+    proc = (dnsmasq_process_t *)Xcalloc(1, sizeof *proc);
+
+    if ((rc = uv_spawn(loop, &proc->base, &opts)) < 0) {
+      ZITI_LOG(ERROR, "failed to spawn dnsmasq: %d/%s", rc, uv_strerror(rc));
+      abort();
+    }
+
+    uv_unref((uv_handle_t *)&proc->base);
+
+    free(etc_path);
+    free(dnsmasq_confdir_path);
+    free(server_conf);
+    free(dnsmasq_confdir_conf);
+    free(pathbuf);
+
+    return proc;
+}
+
+void
+dnsmasq_terminate(dnsmasq_process_t *proc)
+{
+    if (proc) {
+      if (proc->base.pid != (pid_t)-1) {
+        uv_process_kill(&proc->base, SIGTERM);
+      }
+      uv_close((uv_handle_t*)&proc->base, NULL);
+      free(proc);
+    }
+}
+
+netif_driver tun_open(uv_loop_t *loop, uint32_t tun_ip, uint32_t dns_ip, const char *dns_block, char *error, size_t error_len) {
+  netif_driver driver;
+  char *netns;
+  int save_netns = -1;
+
+  netns = getenv("ZITI_NETNS");
+  if (netns)
+      save_netns = join_netns(netns);
+
+  driver = tun_open1(loop, tun_ip, dns_ip, dns_block, error, error_len, netns);
+
+  if (save_netns > -1) {
+      struct netif_handle_s *tun = driver->handle;
+
+      tun->dnsmasq_proc = dnsmasq_spawn(loop, netns);
+      restore_netns(save_netns);
+  }
+
+  return driver;
 }
