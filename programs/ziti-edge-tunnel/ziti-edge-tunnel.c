@@ -159,9 +159,8 @@ static char sockfile[] = "\\\\.\\pipe\\ziti-edge-tunnel.sock";
 static char eventsockfile[] = "\\\\.\\pipe\\ziti-edge-tunnel-event.sock";
 #elif __unix__ || unix || ( __APPLE__ && __MACH__ )
 #include <grp.h>
-#define SOCKET_PATH "/tmp/.ziti"
-static char sockfile[] = SOCKET_PATH "/ziti-edge-tunnel.sock";
-static char eventsockfile[] = SOCKET_PATH "/ziti-edge-tunnel-event.sock";
+#define SOCKFILE "ziti-edge-tunnel.sock"
+#define EVENTSOCKFILE "ziti-edge-tunnel-event.sock"
 #endif
 
 static int sizeof_event_clients_list() {
@@ -669,10 +668,13 @@ static void on_cmd_client(uv_stream_t *s, int status) {
 }
 
 static int start_cmd_socket(uv_loop_t *l) {
+    char *sockfile;
 
     if (uv_is_active((const uv_handle_t *) &cmd_server)) {
         return 0;
     }
+
+    sockfile = get_socket_path(SOCKFILE);
 
     uv_fs_t fs;
     uv_fs_unlink(l, &fs, sockfile, NULL);
@@ -694,9 +696,11 @@ static int start_cmd_socket(uv_loop_t *l) {
 
     CHECK_UV(uv_listen((uv_stream_t *) &cmd_server, 0, on_cmd_client));
 
+    free(sockfile);
     return 0;
 
     uv_err:
+    free(sockfile);
     return -1;
 }
 
@@ -796,10 +800,13 @@ static void send_events_message(const void *message, to_json_fn to_json_f, bool 
 }
 
 static int start_event_socket(uv_loop_t *l) {
+    char *eventsockfile;
 
     if (uv_is_active((const uv_handle_t *) &event_server)) {
         return 0;
     }
+
+    eventsockfile = get_socket_path(EVENTSOCKFILE);
 
     uv_fs_t fs;
     uv_fs_unlink(l, &fs, eventsockfile, NULL);
@@ -811,10 +818,12 @@ static int start_event_socket(uv_loop_t *l) {
     uv_unref((uv_handle_t *) &event_server);
 
     CHECK_UV(uv_listen((uv_stream_t *) &event_server, 0, on_events_client));
+    free(eventsockfile);
 
     return 0;
 
     uv_err:
+    free(eventsockfile);
     return -1;
 }
 
@@ -1699,11 +1708,11 @@ static void run_tunneler_loop(uv_loop_t* ziti_loop) {
     uv_queue_work(ziti_loop, loader, load_identities, load_identities_complete);
 
     int rc0 = 0, rc1;
-    rc0 = rc1 = make_socket_path(ziti_loop);
-    if (rc0 == 0) {
+    // rc0 = rc1 = make_socket_path(ziti_loop);
+    // if (rc0 == 0) {
         rc0 = start_cmd_socket(ziti_loop);
         rc1 = start_event_socket(ziti_loop);
-    }
+    // }
 
     if (rc0 < 0 || rc1 < 0) {
       ZITI_LOG(WARN, "One or more socket servers did not properly start.");
@@ -2330,11 +2339,14 @@ static uv_loop_t* connect_and_send_cmd(char pipesockfile[],uv_connect_t* connect
 }
 
 static void send_message_to_tunnel(char* message) {
+
     uv_pipe_t client_handle;
     uv_connect_t* connect = (uv_connect_t*)malloc(sizeof(uv_connect_t));
     connect->data = strdup(message);
 
+    char *sockfile = get_socket_path(SOCKFILE);
     uv_loop_t* loop = connect_and_send_cmd(sockfile, connect, &client_handle);
+    free(sockfile);
 
     if (loop == NULL) {
         fprintf(stderr, "Cannot run UV loop, loop is null");
