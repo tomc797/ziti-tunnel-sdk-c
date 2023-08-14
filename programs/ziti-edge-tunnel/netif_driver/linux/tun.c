@@ -67,7 +67,7 @@ enum route_command { ROUTE_NOOP = 0, ROUTE_ADD = 1, ROUTE_DEL };
 
 struct zt__netlink_socket {
     uv_udp_t h;
-    uint32_t seq;
+    uint32_t sequence_number;
 };
 
 extern void dns_set_miss_status(int code);
@@ -234,7 +234,7 @@ static zt__netlink_socket_t *netlink_socket(uv_loop_t *loop, int protocol, unsig
 
     struct timeval tv;
     (void) gettimeofday(&tv, NULL);
-    sock->seq = tv.tv_usec;
+    sock->sequence_number = tv.tv_usec;
 
     return sock;
 
@@ -243,22 +243,32 @@ err:
     return NULL;
 }
 
-static int netlink_sendmsg(zt__netlink_socket_t *sock, struct nlmsghdr *nlm)
-{
-    /**
-     * Update sequence number. Ignore zero as special
-     */
-    nlm->nlmsg_seq = sock->seq++;
-    if (!nlm->nlmsg_seq) nlm->nlmsg_seq = sock->seq++;
+typedef struct send_nlmsg_s {
+  uv_udp_send_t base;
+  struct nlmsghdr *nlm;
+} send_nlmsg_t;
 
-    uv_udp_send_t send_req;
-    uv_buf_t send_buf = uv_buf_init((char *)nlm, nlm->nlmsg_len);
-    int status = uv_udp_send(&send_req, &sock->h, &send_buf, 1, NULL, NULL);
+static void netlink_sendmsg_completed_cb(uv_udp_send_t *req, int status)
+{
+    send_nlmsg_t *nlmreq = (send_nlmsg_t*) ((char*)req - offsetof(send_nlmsg_t, base));
+
+    free(nlmreq);
+
+    if (status < 0)
+        ZITI_LOG(WARN, "RTNETLINK: failed sending message: %d/%s", status, uv_strerror(status));
+}
+
+static int netlink_sendmsg(zt__netlink_socket_t *sock, struct nlmsghdr *nlmsg)
+{
+    send_nlmsg_t *req = malloc(sizeof *req);
+    *req = (send_nlmsg_t){.nlm = nlmsg};
+    uv_buf_t buf = uv_buf_init((char *)req->nlm, NLMSG_ALIGN(req->nlm->nlmsg_len));
+    int status = uv_udp_send(&req->base, &sock->h, &buf, 1, NULL, netlink_sendmsg_completed_cb);
     if (status < 0) {
         ZITI_LOG(WARN, "RTNETLINK: failed sending message: %d/%s", status, uv_strerror(status));
+        free(req);
         return -1;
     }
-
     return 0;
 }
 
@@ -369,9 +379,15 @@ static int route_cmd(netif_handle tun, enum route_command cmd, const ziti_addres
             struct rtmsg rtm;
         };
         char data[MAX_NLMSG_LEN];
-    } request = {
+    };
+
+    union request *request = malloc(sizeof *request);
+    if (!request) goto error;
+
+    *request = (union request){
         .nlm.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg)),
         .nlm.nlmsg_flags = NLM_F_REQUEST,
+        .nlm.nlmsg_seq = tun->route_sock->sequence_number++,
         .rtm.rtm_table = RT_TABLE_MAIN,
         .rtm.rtm_scope = RT_SCOPE_LINK,
         .rtm.rtm_protocol = RTPROT_STATIC,
@@ -380,18 +396,18 @@ static int route_cmd(netif_handle tun, enum route_command cmd, const ziti_addres
 
     switch (cmd) {
       case ROUTE_ADD:
-          request.nlm.nlmsg_type = RTM_NEWROUTE;
-          request.nlm.nlmsg_flags |= NLM_F_CREATE|NLM_F_EXCL;
+          request->nlm.nlmsg_type = RTM_NEWROUTE;
+          request->nlm.nlmsg_flags |= NLM_F_CREATE|NLM_F_EXCL;
           break;
       case ROUTE_DEL:
-          request.nlm.nlmsg_type = RTM_DELROUTE;
+          request->nlm.nlmsg_type = RTM_DELROUTE;
           break;
       default:
-          return -1;
+          goto error;
     }
 
     if (dest->type != ziti_address_cidr)
-        return -1;
+        goto error;
 
     size_t iplen;
     switch (dest->addr.cidr.af) {
@@ -405,14 +421,20 @@ static int route_cmd(netif_handle tun, enum route_command cmd, const ziti_addres
           return -1;
     }
 
-    request.rtm.rtm_family = dest->addr.cidr.af;
-    request.rtm.rtm_dst_len = dest->addr.cidr.bits;
-    if (netlink_addattrl(&request.nlm, sizeof request, RTA_DST, &dest->addr.cidr.ip, iplen) < 0)
-        return -1;
-    if (netlink_addattr32(&request.nlm, sizeof request, RTA_OIF, tun->ifindex) < 0)
-        return -1;
+    request->rtm.rtm_family = dest->addr.cidr.af;
+    request->rtm.rtm_dst_len = dest->addr.cidr.bits;
+    if (netlink_addattrl(&request->nlm, sizeof request, RTA_DST, &dest->addr.cidr.ip, iplen) < 0)
+        goto error;
+    if (netlink_addattr32(&request->nlm, sizeof request, RTA_OIF, tun->ifindex) < 0)
+        goto error;
+    if (netlink_sendmsg(tun->route_sock, &request->nlm) < 0)
+        goto error;
 
-    return netlink_sendmsg(tun->route_sock, &request.nlm);
+    return 0;
+
+error:
+    free(request);
+    return -1;
 }
 
 static void process_routes_updates(uv_work_t *wr) {
@@ -656,7 +678,7 @@ static int tun_noop_exclude_rt(netif_handle dev, uv_loop_t *l, const char *addr)
     return 0;
 }
 
-static void netlink_on_response(uv_udp_t *route_sock, ssize_t nread, const uv_buf_t *resp, const struct sockaddr *addr, unsigned flags)
+static void netlink_on_resp(uv_udp_t *route_sock, ssize_t nread, const uv_buf_t *resp, const struct sockaddr *addr, unsigned flags)
 {
     /* UNUSED */
     (void) route_sock;
@@ -689,7 +711,7 @@ done:
 static int become_unprivileged(void)
 {
     int saved_errno;
-    if (geteuid() == 0) {
+    if (geteuid() == (uid_t)-1) {
         struct passwd *pw;
         if ((pw = getpwnam(ZITI_USER)) == NULL) {
             saved_errno = errno;
@@ -736,9 +758,16 @@ static int become_unprivileged(void)
             return -1;
         }
 
-        datap[w].permitted = datap[w].effective = 1UL << b;
+        datap[w].permitted = datap[w].effective = datap[w].inheritable = 1UL << b;
         if (syscall(SYS_capset, &hdr, datap) < 0) {
             ZITI_LOG(ERROR, "capset: %d/%s", errno, strerror(errno));
+            errno = saved_errno;
+            return -1;
+        }
+
+        if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN, 0, 0) < 0) {
+            saved_errno = errno;
+            ZITI_LOG(ERROR, "ambient_raise: %d/%s", errno, strerror(errno));
             errno = saved_errno;
             return -1;
         }
@@ -799,7 +828,7 @@ netif_driver tun_open1(uv_loop_t *loop, uint32_t tun_ip, uint32_t dns_ip, const 
         return NULL;
     }
 
-    int rc = uv_udp_recv_start(&route_sock->h, nl_alloc, netlink_on_response);
+    int rc = uv_udp_recv_start(&route_sock->h, nl_alloc, netlink_on_resp);
     if (rc < 0) {
         if (error != NULL) {
             snprintf(error, error_len, "uv_udp_recv_start: %s", uv_strerror(rc));
@@ -1011,6 +1040,8 @@ netif_driver tun_open(uv_loop_t *loop, uint32_t tun_ip, uint32_t dns_ip, const c
       tun->dnsmasq_proc = dnsmasq_spawn(loop, netns);
       restore_netns(save_netns);
   }
+
+  become_unprivileged();
 
   return driver;
 }
