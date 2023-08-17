@@ -152,8 +152,7 @@ static int join_netns(const char *name)
      * If the netns doesn't exist, try creating it.
      */
     if (netns < 0 && errno == ENOENT) {
-        if (run_command("ip netns add %s", name) == 0)
-            run_command("ip link set lo up");
+        run_command("ip netns add %s", name);
         netns = get_netns_fd(name);
     }
 
@@ -165,7 +164,7 @@ static int join_netns(const char *name)
     (void) close(netns);
     errno = saved_errno;
 
-    if (!ret) {
+    if (ret < 0) {
         abort();
     }
 
@@ -338,18 +337,22 @@ int tun_uv_poll_init(netif_handle tun, uv_loop_t *loop, uv_poll_t *tun_poll_req)
 }
 
 int tun_add_route(netif_handle tun, const char *dest) {
-    if (tun->route_updates == NULL) {
-        tun->route_updates = calloc(1, sizeof(*tun->route_updates));
-    }
-    model_map_set(tun->route_updates, dest, (void*)(uintptr_t)ROUTE_ADD);
+    // if (ziti_address_match_s(dest, &tun->ifaddr) < 0) {
+      if (tun->route_updates == NULL) {
+          tun->route_updates = calloc(1, sizeof(*tun->route_updates));
+      }
+      model_map_set(tun->route_updates, dest, (void*)(uintptr_t)ROUTE_ADD);
+    // }
     return 0;
 }
 
 int tun_delete_route(netif_handle tun, const char *dest) {
-    if (tun->route_updates == NULL) {
-        tun->route_updates = calloc(1, sizeof(*tun->route_updates));
-    }
-    model_map_set(tun->route_updates, dest, (void*)(uintptr_t)ROUTE_DEL);
+    // if (ziti_address_match_s(dest, &tun->ifaddr) < 0) {
+      if (tun->route_updates == NULL) {
+          tun->route_updates = calloc(1, sizeof(*tun->route_updates));
+      }
+      model_map_set(tun->route_updates, dest, (void*)(uintptr_t)ROUTE_DEL);
+    // }
     return 0;
 }
 
@@ -423,9 +426,9 @@ static int route_cmd(netif_handle tun, enum route_command cmd, const ziti_addres
 
     request->rtm.rtm_family = dest->addr.cidr.af;
     request->rtm.rtm_dst_len = dest->addr.cidr.bits;
-    if (netlink_addattrl(&request->nlm, sizeof request, RTA_DST, &dest->addr.cidr.ip, iplen) < 0)
+    if (netlink_addattrl(&request->nlm, sizeof *request, RTA_DST, &dest->addr.cidr.ip, iplen) < 0)
         goto error;
-    if (netlink_addattr32(&request->nlm, sizeof request, RTA_OIF, tun->ifindex) < 0)
+    if (netlink_addattr32(&request->nlm, sizeof *request, RTA_OIF, tun->ifindex) < 0)
         goto error;
     if (netlink_sendmsg(tun->route_sock, &request->nlm) < 0)
         goto error;
@@ -859,17 +862,27 @@ netif_driver tun_open1(uv_loop_t *loop, uint32_t tun_ip, uint32_t dns_ip, const 
     driver->exclude_rt   = netns ? tun_noop_exclude_rt : tun_exclude_rt;
     driver->commit_routes = tun_commit_routes;
 
-    run_command("ip link set %s up", tun->name);
-    run_command("ip addr add %s dev %s", inet_ntoa(*(struct in_addr*)&tun_ip), tun->name);
-
-    run_command("ip link set lo up");
-
-    if (dns_ip) {
-        init_dns_maintainer(loop, tun->name, dns_ip);
+    unsigned int masklen;
+    parse_ziti_address_str(&tun->ifaddr, dns_block);
+    if (ziti_address_match_s(inet_ntoa((struct in_addr){.s_addr=tun_ip}), &tun->ifaddr) < 0) {
+        masklen = 32;
+    } else {
+        masklen = tun->ifaddr.addr.cidr.bits;
     }
+    tun->ifaddr.addr.cidr.ip = (struct in6_addr){.s6_addr32[0] = tun_ip};
+    tun->ifaddr.addr.cidr.bits = masklen;
 
-    if (dns_block) {
-        run_command("ip route add %s dev %s", dns_block, tun->name);
+    run_command("whoami > /tmp/whoami");
+    run_command("ip link set lo up");
+    run_command("ip link set %s up", tun->name);
+    run_command("ip addr add %s/%u dev %s", inet_ntoa(*(struct in_addr*)&tun_ip), masklen, tun->name);
+
+    if (masklen == 32)
+      run_command("ip route add %s dev %s scope link", dns_block, tun->name);
+
+
+    if (!netns && dns_ip) {
+        init_dns_maintainer(loop, tun->name, dns_ip);
     }
 
     return driver;
@@ -955,15 +968,15 @@ dnsmasq_spawn(uv_loop_t *loop, const char *netns_name)
     int rc;
 
     // namespace aware
+    Xasprintf(&server_conf, "--server=%s", "100.64.0.2");
+
     if (netns_name) {
       Xasprintf(&etc_path, "/etc/netns/%s", netns_name);
     } else {
       Xasprintf(&etc_path, "/etc");
     }
     Xasprintf(&dnsmasq_confdir_path, "%s/dnsmasq.d", etc_path);
-
-    Xasprintf(&server_conf, "--server=%s", "100.64.0.2");
-    if (access(dnsmasq_confdir_path, R_OK|X_OK)) {
+    if (access(dnsmasq_confdir_path, R_OK|X_OK) == 0) {
         Xasprintf(&dnsmasq_confdir_conf, "--conf-dir=%s,*.conf", dnsmasq_confdir_path);
     }
 
@@ -984,7 +997,7 @@ dnsmasq_spawn(uv_loop_t *loop, const char *netns_name)
     argz[7] = NULL;
 
     envz[0] = path;
-    envz[1] = "LANG=C";
+    envz[1] = "LC_ALL=C";
     envz[2] = NULL;
 
     opts.file = (char *) argz[0];

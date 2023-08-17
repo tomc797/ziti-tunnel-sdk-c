@@ -30,6 +30,8 @@ struct netif_handle_s {
 
     int ifindex;
 
+    ziti_address ifaddr;
+
     zt__netlink_socket_t *route_sock;
 
     zt__dnsmasq_process_t *dnsmasq_proc;
