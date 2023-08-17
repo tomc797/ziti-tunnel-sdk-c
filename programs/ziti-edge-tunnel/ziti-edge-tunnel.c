@@ -677,7 +677,8 @@ static int start_cmd_socket(uv_loop_t *l) {
     sockfile = get_socket_path(SOCKFILE);
 
     uv_fs_t fs;
-    uv_fs_unlink(l, &fs, sockfile, NULL);
+    int rc = uv_fs_unlink(l, &fs, sockfile, NULL);
+    if (rc) printf("unlink %s: rc=%d\n", sockfile, rc);
 
 #define CHECK_UV(op) do{ \
     int uv_rc = (op);    \
@@ -1826,7 +1827,7 @@ static int run_opts(int argc, char *argv[]) {
                 break;
             }
             case 'I':
-                config_dir = optarg;
+                config_dir = make_identifier_dirpath(optarg);
                 identity_provided = true;
                 break;
             case 'v':
@@ -1875,7 +1876,7 @@ static int run_host_opts(int argc, char *argv[]) {
                 break;
             }
             case 'I':
-                config_dir = optarg;
+                config_dir = make_identifier_dirpath(optarg);
                 identity_provided = true;
                 break;
             case 'v':

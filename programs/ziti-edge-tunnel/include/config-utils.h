@@ -23,4 +23,7 @@ char* get_identifier_path();
 char* get_config_file_name(char* config_path);
 char* get_backup_config_file_name(char* config_path);
 
+char *get_socket_path(const char *sockname);
+char *make_identifier_dirpath(const char *config_dir);
+
 #endif //ZITI_TUNNEL_SDK_C_CONFIG_UTILS_H
